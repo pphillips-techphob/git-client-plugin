@@ -8,6 +8,7 @@ import hudson.Util;
 import hudson.model.TaskListener;
 import hudson.plugins.git.Branch;
 import hudson.plugins.git.GitException;
+import hudson.plugins.git.GitLockFailedException;
 import hudson.plugins.git.IGitAPI;
 import hudson.plugins.git.IndexEntry;
 import hudson.util.StreamTaskListener;
@@ -21,6 +22,7 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.URIish;
+import org.jenkinsci.plugins.gitclient.ChangelogCommand;
 import org.jvnet.hudson.test.Bug;
 import org.jvnet.hudson.test.TemporaryDirectoryAllocator;
 
@@ -208,10 +210,88 @@ public abstract class GitAPITestCase extends TestCase {
         temporaryDirectoryAllocator.dispose();
     }
 
-    public void test_initialize_repository() throws Exception {
-        w.git.init();
-        String status = w.cmd("git status");
-        assertTrue("unexpected status " + status, status.contains("On branch master"));
+    private void check_remote_url(final String repositoryName) throws InterruptedException, IOException {
+        assertEquals("Wrong remote URL", localMirror(), w.git.getRemoteUrl(repositoryName));
+        String remotes = w.cmd("git remote -v");
+        assertTrue("remote URL has not been updated", remotes.contains(localMirror()));
+    }
+
+    private void check_branches(String expectedBranchName) throws InterruptedException {
+        Set<Branch> branches = w.git.getBranches();
+        Collection names = Collections2.transform(branches, new Function<Branch, String>() {
+            public String apply(Branch branch) {
+                return branch.getName();
+            }
+        });
+        assertTrue(expectedBranchName + " branch not listed in " + names, names.contains(expectedBranchName));
+    }
+
+    /** Clone arguments include:
+     *   repositoryName(String) - if omitted, CliGit does not set a remote repo name
+     *   shallow() - no relevant assertion of success or failure of this argument
+     *   shared() - not implemented on CliGit, not verified on JGit
+     *   reference() - not implemented on JGit, not verified on CliGit
+     *
+     * CliGit requires the w.git.checkout() call otherwise no branch
+     * is checked out.  JGit checks out the master branch by default.
+     * That means JGit is nearer to command line git (in that case)
+     * than CliGit is.
+     */
+    public void test_clone() throws IOException, InterruptedException
+    {
+        w.git.clone_().url(localMirror()).repositoryName("origin").execute();
+        if (w.git instanceof CliGitAPIImpl) {
+            w.git.setRemoteUrl("origin", localMirror());
+            w.git.checkout("origin/master", "master");
+        }
+        check_remote_url("origin");
+        check_branches("master");
+    }
+
+    public void test_clone_repositoryName() throws IOException, InterruptedException
+    {
+        w.git.clone_().url(localMirror()).repositoryName("upstream").execute();
+        if (w.git instanceof CliGitAPIImpl) {
+            w.git.setRemoteUrl("upstream", localMirror());
+            w.git.checkout("upstream/master", "master");
+        }
+        check_remote_url("upstream");
+        check_branches("master");
+    }
+
+    public void test_clone_shallow() throws IOException, InterruptedException
+    {
+        w.git.clone_().url(localMirror()).repositoryName("origin").shallow().execute();
+        if (w.git instanceof CliGitAPIImpl) {
+            w.git.setRemoteUrl("origin", localMirror());
+            w.git.checkout("origin/master", "master");
+        }
+        check_remote_url("origin");
+        check_branches("master");
+    }
+
+    /** shared is not implemented in CliGitAPIImpl. */
+    @NotImplementedInCliGit
+    public void test_clone_shared() throws IOException, InterruptedException
+    {
+        w.git.clone_().url(localMirror()).repositoryName("origin").shared().execute();
+        if (w.git instanceof CliGitAPIImpl) {
+            w.git.setRemoteUrl("origin", localMirror());
+            w.git.checkout("origin/master", "master");
+        }
+        check_remote_url("origin");
+        check_branches("master");
+    }
+
+    public void test_clone_reference() throws IOException, InterruptedException
+    {
+        w.git.clone_().url(localMirror()).repositoryName("origin").reference(localMirror()).execute();
+        if (w.git instanceof CliGitAPIImpl) {
+            w.git.setRemoteUrl("origin", localMirror());
+            w.git.checkout("origin/master", "master");
+        }
+        check_remote_url("origin");
+        check_branches("master");
     }
 
     public void test_detect_commit_in_repo() throws Exception {
@@ -224,6 +304,49 @@ public abstract class GitAPITestCase extends TestCase {
         assertFalse(w.git.isCommitInRepo(ObjectId.fromString("1111111111111111111111111111111111111111")));
     }
 
+    @Deprecated
+    public void test_lsTree_non_recursive() throws IOException, InterruptedException {
+        w.init();
+        w.touch("file1", "file1 fixed content");
+        w.add("file1");
+        w.commit("commit1");
+        String expectedBlobSHA1 = "3f5a898e0c8ea62362dbf359cf1a400f3cfd46ae";
+        List<IndexEntry> tree = w.igit().lsTree("HEAD", false);
+        assertEquals("Wrong blob sha1", expectedBlobSHA1, tree.get(0).getObject());
+        assertEquals("Wrong number of tree entries", 1, tree.size());
+    }
+
+    @Deprecated
+    public void test_lsTree_recursive() throws IOException, InterruptedException {
+        w.init();
+        w.file("dir1").mkdir();
+        w.touch("dir1/file1", "dir1/file1 fixed content");
+        w.add("dir1/file1");
+        w.touch("file2", "file2 fixed content");
+        w.add("file2");
+        w.commit("commit-dir-and-file");
+        String expectedBlob1SHA1 = "a3ee484019f0576fcdeb48e682fa1058d0c74435";
+        String expectedBlob2SHA1 = "aa1b259ac5e8d6cfdfcf4155a9ff6836b048d0ad";
+        List<IndexEntry> tree = w.igit().lsTree("HEAD", true);
+        assertEquals("Wrong blob 1 sha1", expectedBlob1SHA1, tree.get(0).getObject());
+        assertEquals("Wrong blob 2 sha1", expectedBlob2SHA1, tree.get(1).getObject());
+        assertEquals("Wrong number of tree entries", 2, tree.size());
+    }
+    
+    /** Is implemented in JGit, but returns an empty URL for this
+     * case.  Test is disabled for JGit, since it is a deprecated API
+     * that we can hope is not used with the newer JGit
+     * implementation.
+     */
+    @NotImplementedInJGit
+    @Deprecated
+    public void test_getRemoteURL_two_args() throws Exception {
+        w.init();
+        w.cmd("git remote add origin https://github.com/jenkinsci/git-client-plugin.git");
+        w.cmd("git remote add ndeloof git@github.com:ndeloof/git-client-plugin.git");
+        String remoteUrl = w.igit().getRemoteUrl("origin", ".git");
+        assertEquals("unexepected remote URL " + remoteUrl, "https://github.com/jenkinsci/git-client-plugin.git", remoteUrl);
+    }
 
     public void test_getRemoteURL() throws Exception {
         w.init();
@@ -233,12 +356,37 @@ public abstract class GitAPITestCase extends TestCase {
         assertEquals("unexepected remote URL " + remoteUrl, "https://github.com/jenkinsci/git-client-plugin.git", remoteUrl);
     }
 
+    public void test_getRemoteURL_local_clone() throws Exception {
+        w = clone(localMirror());
+        assertEquals("Wrong origin URL", localMirror(), w.git.getRemoteUrl("origin"));
+        String remotes = w.cmd("git remote -v");
+        assertTrue("remote URL has not been updated", remotes.contains(localMirror()));
+    }
+
     public void test_setRemoteURL() throws Exception {
         w.init();
         w.cmd("git remote add origin https://github.com/jenkinsci/git-client-plugin.git");
         w.git.setRemoteUrl("origin", "git@github.com:ndeloof/git-client-plugin.git");
         String remotes = w.cmd("git remote -v");
         assertTrue("remote URL has not been updated", remotes.contains("git@github.com:ndeloof/git-client-plugin.git"));
+    }
+
+    public void test_setRemoteURL_local_clone() throws Exception {
+        w = clone(localMirror());
+        String originURL = "https://github.com/jenkinsci/git-client-plugin.git";
+        w.git.setRemoteUrl("origin", originURL);
+        assertEquals("Wrong origin URL", originURL, w.git.getRemoteUrl("origin"));
+        String remotes = w.cmd("git remote -v");
+        assertTrue("remote URL has not been updated", remotes.contains(originURL));
+    }
+
+    public void test_addRemoteUrl_local_clone() throws Exception {
+        w = clone(localMirror());
+        assertEquals("Wrong origin URL before add", localMirror(), w.git.getRemoteUrl("origin"));
+        String upstreamURL = "https://github.com/jenkinsci/git-client-plugin.git";
+        w.git.addRemoteUrl("upstream", upstreamURL);
+        assertEquals("Wrong upstream URL", upstreamURL, w.git.getRemoteUrl("upstream"));
+        assertEquals("Wrong origin URL after add", localMirror(), w.git.getRemoteUrl("origin"));
     }
 
     public void test_clean() throws Exception {
@@ -414,9 +562,21 @@ public abstract class GitAPITestCase extends TestCase {
         w.tag("another_test");
         w.tag("yet_another");
         Set<String> tags = w.git.getTagNames("*test");
-        assertTrue("expected tag not listed", tags.contains("test"));
-        assertTrue("expected tag not listed", tags.contains("another_test"));
-        assertFalse("unexpected tag listed", tags.contains("yet_another"));
+        assertTrue("expected tag test not listed", tags.contains("test"));
+        assertTrue("expected tag another_test not listed", tags.contains("another_test"));
+        assertFalse("unexpected yet_another tag listed", tags.contains("yet_another"));
+    }
+
+    public void test_list_tags_without_filter() throws Exception {
+        w.init();
+        w.commit("init");
+        w.tag("test");
+        w.tag("another_test");
+        w.tag("yet_another");
+        Set<String> allTags = w.git.getTagNames(null);
+        assertTrue("tag 'test' not listed", allTags.contains("test"));
+        assertTrue("tag 'another_test' not listed", allTags.contains("another_test"));
+        assertTrue("tag 'yet_another' not listed", allTags.contains("yet_another"));
     }
 
     public void test_tag_exists() throws Exception {
@@ -679,12 +839,90 @@ public abstract class GitAPITestCase extends TestCase {
         }
     }
 
+    @Deprecated
+    public void test_merge_refspec() throws Exception {
+        w.init();
+        w.commit("init");
+        w.cmd("git branch branch1");
+        w.cmd("git checkout branch1");
+        w.touch("file1", "content1");
+        w.add("file1");
+        w.commit("commit1-branch1");
+        w.cmd("git branch branch2 master");
+        w.cmd("git checkout branch2");
+        File f = w.touch("file2", "content2");
+        w.add("file2");
+        w.commit("commit2-branch2");
+        assertFalse("file1 exists before merge", w.exists("file1"));
+        w.igit().merge("branch1");
+        assertTrue("file1 does not exist after merge", w.exists("file1"));
+    }
+
+    /**
+     * Checks that the ChangelogCommand abort() API does not write
+     * output to the destination.  Does not check that the abort() API
+     * releases resources.
+     *
+     * Annotated as @NotImplementedInJGit because the test fails in
+     * the JGit implementation.  There is an implementation in JGit,
+     * but it does not seem to provide any data when executed.
+     */
+    @NotImplementedInJGit
+    public void test_changelog_abort() throws InterruptedException, IOException
+    {
+        final String logMessage = "changelog-abort-test-commit";
+        w.init();
+        w.touch("file-changelog-abort", "changelog abort file contents " + java.util.UUID.randomUUID().toString());
+        w.add("file-changelog-abort");
+        w.commit(logMessage);
+        String sha1 = w.revParse("HEAD").name();
+        ChangelogCommand changelogCommand = w.git.changelog();
+        StringWriter writer = new StringWriter();
+        changelogCommand.to(writer);
+
+        /* Abort the changelog, confirm no content was written */
+        changelogCommand.abort();
+        assertEquals("aborted changelog wrote data", "", writer.toString());
+
+        /* Execute the changelog, confirm expected content was written */
+        changelogCommand = w.git.changelog();
+        changelogCommand.to(writer);
+        changelogCommand.execute();
+        assertTrue("No log message in " + writer.toString(), writer.toString().contains(logMessage));
+        assertTrue("No SHA1 in " + writer.toString(), writer.toString().contains(sha1));
+    }
+
     public void test_getHeadRev() throws Exception {
         Map<String,ObjectId> heads = w.git.getHeadRev("https://github.com/jenkinsci/git-client-plugin.git");
         System.out.println(heads);
         assertTrue(heads.containsKey("refs/heads/master"));
     }
 
+    private void check_changelog_sha1(final String sha1, final String branchName) throws InterruptedException
+    {
+        ChangelogCommand changelogCommand = w.git.changelog();
+        changelogCommand.max(1);
+        StringWriter writer = new StringWriter();
+        changelogCommand.to(writer);
+        changelogCommand.execute();
+        String splitLog[] = writer.toString().split("[\\n\\r]", 3); // Extract first line of changelog
+        assertEquals("Wrong changelog line 1 on branch " + branchName, "commit " + sha1, splitLog[0]);
+    }
+
+    /* Is implemented in JGit, but returns no results.  Temporarily
+     * marking this test as not implemented in JGit so that its
+     * failure does not distract from other development.
+     */
+    @NotImplementedInJGit
+    public void test_changelog() throws Exception {
+        w = clone(localMirror());
+        String sha1Prev = w.revParse("HEAD").name();
+        w.touch("changelog-file", "changelog-file-content-" + sha1Prev);
+        w.add("changelog-file");
+        w.commit("changelog-commit-message");
+        String sha1 = w.revParse("HEAD").name();
+        check_changelog_sha1(sha1, "master");
+    }
 
     public void test_show_revision_for_merge() throws Exception {
         w = clone(localMirror());
@@ -711,7 +949,7 @@ public abstract class GitAPITestCase extends TestCase {
         });
         Collection<String> paths = Collections2.transform(diffs, new Function<String, String>() {
             public String apply(String diff) {
-                return diff.substring(diff.indexOf('\t')+1);
+                return diff.substring(diff.indexOf('\t')+1).trim(); // Windows diff output ^M removed by trim()
             }
         });
 
@@ -727,6 +965,25 @@ public abstract class GitAPITestCase extends TestCase {
         assertTrue(paths.contains("src/test/java/org/jenkinsci/plugins/gitclient/JGitAPIImplTest.java"));
         // Previous implementation included other commits, and listed irrelevant changes
         assertFalse(paths.contains("README.md"));
+    }
+
+    private void check_bounded_changelog_sha1(final String sha1Begin, final String sha1End, final String branchName) throws InterruptedException
+    {
+        StringWriter writer = new StringWriter();
+        w.git.changelog(sha1Begin, sha1End, writer);
+        String splitLog[] = writer.toString().split("[\\n\\r]", 3); // Extract first line of changelog
+        assertEquals("Wrong bounded changelog line 1 on branch " + branchName, "commit " + sha1End, splitLog[0]);
+        assertTrue("Begin sha1 " + sha1Begin + " not in changelog: " + writer.toString(), writer.toString().contains(sha1Begin));
+    }
+
+    public void test_changelog_bounded() throws Exception {
+        w = clone(localMirror());
+        String sha1Prev = w.revParse("HEAD").name();
+        w.touch("changelog-file", "changelog-file-content-" + sha1Prev);
+        w.add("changelog-file");
+        w.commit("changelog-commit-message");
+        String sha1 = w.revParse("HEAD").name();
+        check_bounded_changelog_sha1(sha1Prev, sha1, "master");
     }
 
     public void test_show_revision_for_single_commit() throws Exception {
@@ -804,6 +1061,33 @@ public abstract class GitAPITestCase extends TestCase {
         assertEquals("X",formatBranches(w.igit().getBranchesContaining("X")));
     }
 
+    public void test_checkout_null_ref() throws Exception {
+        w = clone(localMirror());
+        String branches = w.cmd("git branch -l");
+        assertTrue("master branch not current branch in " + branches, branches.contains("* master"));
+        final String branchName = "test-checkout-null-ref-branch-" + java.util.UUID.randomUUID().toString();
+        branches = w.cmd("git branch -l");
+        assertFalse("test branch originally listed in " + branches, branches.contains(branchName));
+        w.git.checkout(null, branchName);
+        branches = w.cmd("git branch -l");
+        assertTrue("test branch not current branch in " + branches, branches.contains("* " + branchName));
+    }
+
+    public void test_checkout() throws Exception {
+        w = clone(localMirror());
+        String branches = w.cmd("git branch -l");
+        assertTrue("master branch not current branch in " + branches, branches.contains("* master"));
+        final String branchName = "test-checkout-branch-" + java.util.UUID.randomUUID().toString();
+        branches = w.cmd("git branch -l");
+        assertFalse("test branch originally listed in " + branches, branches.contains(branchName));
+        w.git.checkout("6b7bbcb8f0e51668ddba349b683fb06b4bd9d0ea", branchName); // git-client-1.6.0
+        branches = w.cmd("git branch -l");
+        assertTrue("test branch not current branch in " + branches, branches.contains("* " + branchName));
+        String sha1 = w.revParse("HEAD").name();
+        String sha1Expected = "6b7bbcb8f0e51668ddba349b683fb06b4bd9d0ea";
+        assertEquals("Wrong SHA1 as checkout of git-client-1.6.0", sha1Expected, sha1);
+    }
+
     @Bug(19108)
     public void test_checkoutBranch() throws Exception {
         w.init();
@@ -819,6 +1103,36 @@ public abstract class GitAPITestCase extends TestCase {
         Ref head = w.repo().getRef("HEAD");
         assertTrue(head.isSymbolic());
         assertEquals("refs/heads/foo",head.getTarget().getName());
+    }
+
+    public void test_revList_remote_branch() throws Exception {
+        w = clone(localMirror());
+        List<ObjectId> revList = w.git.revList("origin/1.4.x");
+        assertEquals("Wrong list size: " + revList, 267, revList.size());
+        Ref branchRef = w.repo().getRef("origin/1.4.x");
+        assertTrue("origin/1.4.x not in revList", revList.contains(branchRef.getObjectId()));
+    }
+
+    public void test_revList_tag() throws Exception {
+        w.init();
+        w.commit("c1");
+        Ref commitRefC1 = w.repo().getRef("HEAD");
+        w.tag("t1");
+        Ref tagRefT1 = w.repo().getRef("t1");
+        w.commit("c2");
+        Ref commitRefC2 = w.repo().getRef("HEAD");
+        List<ObjectId> revList = w.git.revList("t1");
+        assertTrue("c1 not in revList", revList.contains(commitRefC1.getObjectId()));
+        assertEquals("Wrong list size: " + revList, 1, revList.size());
+    }
+
+    public void test_revList_local_branch() throws Exception {
+        w.init();
+        w.commit("c1");
+        w.tag("t1");
+        w.commit("c2");
+        List<ObjectId> revList = w.git.revList("master");
+        assertEquals("Wrong list size: " + revList, 2, revList.size());
     }
 
     @Bug(20153)
@@ -873,7 +1187,7 @@ public abstract class GitAPITestCase extends TestCase {
             FileUtils.touch(lock);
             w.git.checkoutBranch("somebranch", "master");
             fail();
-        } catch (GitException e) {
+        } catch (GitLockFailedException e) {
             // expected
         } finally {
             lock.delete();
