@@ -14,6 +14,7 @@ import hudson.Util;
 import hudson.model.TaskListener;
 import hudson.plugins.git.Branch;
 import hudson.plugins.git.GitException;
+import hudson.plugins.git.GitLockFailedException;
 import hudson.plugins.git.IGitAPI;
 import hudson.plugins.git.IndexEntry;
 import hudson.plugins.git.Revision;
@@ -57,6 +58,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.net.ssl.SSLException;
 
 import static org.apache.commons.httpclient.params.HttpMethodParams.USER_AGENT;
 
@@ -94,29 +96,6 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
     public GitClient subGit(String subdir) {
         return new CliGitAPIImpl(gitExe, new File(workspace, subdir), listener, environment);
-    }
-
-    private int[] getGitVersion() throws InterruptedException {
-        int minorVer = 1;
-        int majorVer = 6;
-
-        try {
-            String v = firstLine(launchCommand("--version")).trim();
-            listener.getLogger().println("git --version\n" + v);
-            Pattern p = Pattern.compile("git version ([0-9]+)\\.([0-9+])\\..*");
-            Matcher m = p.matcher(v);
-            if (m.matches() && m.groupCount() >= 2) {
-                try {
-                    majorVer = Integer.parseInt(m.group(1));
-                    minorVer = Integer.parseInt(m.group(2));
-                } catch (NumberFormatException e) { }
-            }
-        } catch(GitException ex) {
-            listener.getLogger().println("Error trying to determine the git version: " + ex.getMessage());
-            listener.getLogger().println("Assuming 1.6");
-        }
-
-        return new int[]{majorVer,minorVer};
     }
 
     public void init() throws GitException, InterruptedException {
@@ -500,6 +479,10 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
             public ChangelogCommand max(int n) {
                 this.n = n;
                 return this;
+            }
+
+            public void abort() {
+                /* No cleanup needed to abort the CliGitAPIImpl ChangelogCommand */
             }
 
             public void execute() throws GitException, InterruptedException {
@@ -927,11 +910,6 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         return launchCommand(new ArgumentListBuilder(args));
     }
 
-    public String launchCommandIn(File workDir, String... args) throws GitException, InterruptedException {
-        return launchCommandIn(new ArgumentListBuilder(args), workspace);
-    }
-
-
     private String launchCommandWithCredentials(ArgumentListBuilder args, File workDir,
                                                 StandardCredentials credentials,
                                                 @NonNull String url) throws GitException, InterruptedException {
@@ -976,7 +954,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                 if (credentials != null) {
                     listener.getLogger().println("using .gitcredentials to set credentials");
 
-                    String urlWithCredentials = getGitCrendentialsURL(url, credentials);
+                    String urlWithCredentials = getGitCredentialsURL(url, credentials);
                     store = createGitCredentialsStore(urlWithCredentials);
                     launchCommandIn(workDir, "config", "--global", "credential.helper", "store --file=\\\"" + store.getAbsolutePath() + "\\\"");
                 }
@@ -984,7 +962,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
             return launchCommandIn(args, workDir, env);
         } catch (IOException e) {
-            throw new GitException("Failed to setup ssh credentials", e);
+            throw new GitException("Failed to setup credentials", e);
         } finally {
             if (pass != null) pass.delete();
             if (key != null) key.delete();
@@ -1076,6 +1054,10 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         return ssh;
     }
 
+    private String launchCommandIn(File workDir, String... args) throws GitException, InterruptedException {
+        return launchCommandIn(new ArgumentListBuilder(args), workDir);
+    }
+
     private String launchCommandIn(ArgumentListBuilder args, File workDir) throws GitException, InterruptedException {
         return launchCommandIn(args, workDir, environment);
     }
@@ -1088,7 +1070,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         EnvVars environment = new EnvVars(env);
         if (!env.containsKey("SSH_ASKPASS")) {
             // GIT_ASKPASS supersed SSH_ASKPASS when set, so don't mask SSH passphrase when set
-            environment.put("GIT_ASKPASS", launcher.isUnix() ? "/bin/echo " : "echo ");
+            environment.put("GIT_ASKPASS", launcher.isUnix() ? "/bin/echo" : "echo ");
         }
         String command = "git " + StringUtils.join(args.toCommandArray(), " ");
         try {
@@ -1223,7 +1205,11 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                 checkout(ref, branch);
             }
         } catch (GitException e) {
-            throw new GitException("Could not checkout " + branch + " with start point " + ref, e);
+            if (Pattern.compile("index\\.lock").matcher(e.getMessage()).find()) {
+                throw new GitLockFailedException("Could not lock repository. Please try again", e);
+            } else {
+                throw new GitException("Could not checkout " + branch + " with start point " + ref, e);
+            }
         }
     }
 
@@ -1530,15 +1516,15 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
     /**
      * Compute the URL to be used by <a href="https://www.kernel.org/pub/software/scm/git/docs/git-credential-store.html">git-credentials-store</a>
      */
-    private String getGitCrendentialsURL(String url, StandardCredentials cred) {
+    private String getGitCredentialsURL(String url, StandardCredentials cred) {
         try {
-            return getGitCrendentialsURL(new URIish(url), cred);
+            return getGitCredentialsURL(new URIish(url), cred);
         } catch (URISyntaxException e) {
             throw new GitException("invalid repository URL " + url, e);
         }
     }
 
-    private String getGitCrendentialsURL(URIish u, StandardCredentials cred) {
+    private String getGitCredentialsURL(URIish u, StandardCredentials cred) {
         String scheme = u.getScheme();
         // gitcredentials format is sheme://user:password@hostname
         URIish uri = new URIish()
@@ -1615,6 +1601,8 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                 throw new GitException("Failed to connect to " + u.toString()
                     + (cred != null ? " using credentials " + cred.getDescription() : "" )
                     + " (status = "+status+")");
+        } catch (SSLException e) {
+            throw new GitException(e.getLocalizedMessage());
         } catch (IOException e) {
             throw new GitException("Failed to connect to " + u.toString()
                     + (cred != null ? " using credentials " + cred.getDescription() : "" ));
